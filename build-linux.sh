@@ -12,3 +12,4 @@ for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown
     set -- "$@" "$name"
 done
 (cd dist && shasum -a 256 "$@" > SHA256SUMS)
+install -m 755 install.sh dist/install.sh
