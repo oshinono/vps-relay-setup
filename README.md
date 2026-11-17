@@ -1,11 +1,5 @@
 # vps-relay-setup
 
-GitHub Actions собирает четыре статических Linux-бинарника при push в `main` или ручном запуске workflow **Linux builds**. Файлы доступны в артефакте `relay-tui-linux`; `dist/` не хранится в Git.
+При push в `main` GitHub Actions публикует четыре статических Linux-бинарника и `SHA256SUMS` в [GitHub Releases](https://github.com/oshinono/vps-relay-setup/releases/latest). Используется встроенный `GITHUB_TOKEN`. Для скачивания без токена репозиторий должен быть публичным.
 
-Для автопубликации:
-
-1. Создайте проект Cloudflare Pages с Direct Upload и production-веткой `main`.
-2. В GitHub → Settings → Secrets and variables → Actions добавьте секреты `CLOUDFLARE_ACCOUNT_ID` и `CLOUDFLARE_API_TOKEN` (право Account / Cloudflare Pages / Edit). Если проект называется не `relay-vps-setup`, задайте переменную `CLOUDFLARE_PAGES_PROJECT`.
-3. Сверьте URL проекта с `base` в `install.sh`. Если адрес отличается, обновите его. Запустите workflow из `main`.
-
-Pages публикует `install.sh`, `SHA256SUMS` и бинарники в корне сайта. Установщик скачивает файлы оттуда без доступа к GitHub.
+На Cloudflare Pages опубликуйте только `install.sh` в корне сайта. Секреты Cloudflare в GitHub не нужны. Скрипт выбирает архитектуру, скачивает бинарник из последнего релиза и проверяет SHA-256.

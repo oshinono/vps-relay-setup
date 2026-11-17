@@ -12,7 +12,7 @@ case "$arch" in
     *) fail "Неподдерживаемая архитектура: $arch" ;;
 esac
 
-base=https://relay-vps-setup.oshinonoo.pages.dev
+base=https://github.com/oshinono/vps-relay-setup/releases/latest/download
 name="relay-tui-$target"
 tmp=$(mktemp -d ./.relay-tui.XXXXXXXX)
 trap 'rm -rf -- "$tmp"' EXIT
