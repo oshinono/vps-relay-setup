@@ -26,3 +26,4 @@ printf '%s  %s\n' "$hash" "$name" | (cd "$tmp" && sha256sum -c -)
 chmod 755 "$tmp/$name"
 ln -T -- "$tmp/$name" ./relay-tui || fail 'Не удалось создать ./relay-tui. Проверь права и не занят ли путь.'
 printf 'Скачан ./relay-tui (%s)\n' "$arch"
+./relay-tui </dev/tty

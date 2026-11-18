@@ -3,6 +3,10 @@ name: Linux builds
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'install.sh'
+      - 'build-linux.sh'
+      - 'README.md'
   workflow_dispatch:
 
 permissions:
