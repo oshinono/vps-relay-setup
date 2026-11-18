@@ -16,7 +16,7 @@ esac
 as_root=()
 if (( EUID != 0 )); then
     command -v sudo >/dev/null || fail 'sudo не установлен. Запусти установщик от root.'
-    sudo -v </dev/tty || fail 'Не удалось получить права через sudo. Запусти установщик от root.'
+    # sudo -v может требовать пароль, даже если конкретная команда разрешена без него.
     as_root=(sudo --)
 fi
 bin_dir=/usr/local/bin
