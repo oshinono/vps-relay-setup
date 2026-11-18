@@ -12,23 +12,34 @@ case "$arch" in
     *) fail "Неподдерживаемая архитектура: $arch" ;;
 esac
 
-if [[ -e ./relay-tui || -L ./relay-tui ]]; then
-    [[ -f ./relay-tui && -x ./relay-tui && ! -L ./relay-tui ]] || fail './relay-tui не является исполняемым файлом или это символическая ссылка.'
-    exec ./relay-tui </dev/tty
+if (( EUID == 0 )); then
+    bin_dir=/usr/local/bin
+else
+    bin_dir="${HOME:?HOME не задан}/.local/bin"
+fi
+bin="$bin_dir/relay-tui"
+mkdir -p -- "$bin_dir"
+if [[ -e $bin || -L $bin ]]; then
+    [[ -f $bin && ! -L $bin ]] || fail "$bin не является обычным файлом. Установка отменена."
 fi
 
 base=https://github.com/oshinono/vps-relay-setup/releases/latest/download
 name="relay-tui-$target"
-tmp=$(mktemp -d ./.relay-tui.XXXXXXXX)
+tmp=$(mktemp -d "$bin_dir/.relay-tui.XXXXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 
-fetch() { curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 120 "$base/$1" -o "$tmp/$1"; }
-fetch SHA256SUMS
+fetch() { curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time "$2" "$base/$1" -o "$tmp/$1"; }
+fetch SHA256SUMS 15
 hash=$(awk -v name="$name" '$2 == name {print $1}' "$tmp/SHA256SUMS")
 [[ $hash =~ ^[[:xdigit:]]{64}$ ]] || fail "Нет корректной суммы SHA-256 для $name"
-fetch "$name"
-printf '%s  %s\n' "$hash" "$name" | (cd "$tmp" && sha256sum -c -)
-chmod 755 "$tmp/$name"
-ln -T -- "$tmp/$name" ./relay-tui || fail 'Не удалось создать ./relay-tui. Проверь права и не занят ли путь.'
-printf 'Скачан ./relay-tui (%s)\n' "$arch"
-./relay-tui </dev/tty
+if [[ -f $bin ]] && (cd "$bin_dir" && printf '%s  relay-tui\n' "$hash" | sha256sum --status -c -); then
+    printf 'Актуальная версия: %s\n' "$bin"
+else
+    fetch "$name" 120
+    printf '%s  %s\n' "$hash" "$name" | (cd "$tmp" && sha256sum -c -)
+    chmod 755 "$tmp/$name"
+    mv -fT -- "$tmp/$name" "$bin"
+    printf 'Установлен %s (%s)\n' "$bin" "$arch"
+fi
+[[ -x $bin ]] || fail "$bin не исполняемый. Выполни: chmod +x '$bin'"
+"$bin" </dev/tty

@@ -6,6 +6,9 @@ use std::{
     net::Ipv4Addr,
     path::Path,
     process::Command,
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
+    time::Duration,
 };
 
 use ratatui::{
@@ -18,6 +21,57 @@ use ratatui::{
 
 const TAG: &str = "relay-tui";
 const CONFIG: &str = "/etc/relay-tui/routes";
+const RELEASE_SUMS: &str =
+    "https://github.com/oshinono/vps-relay-setup/releases/latest/download/SHA256SUMS";
+
+fn release_hash(sums: &str, asset: &str) -> Option<String> {
+    let mut matches = sums.lines().filter_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        (parts.next()? == asset).then_some(hash)
+    });
+    let hash = matches.next()?;
+    (matches.next().is_none() && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| hash.to_ascii_lowercase())
+}
+
+fn check_update() -> Result<bool, String> {
+    let target = match std::env::consts::ARCH {
+        "x86_64" => "x86_64-unknown-linux-musl",
+        "aarch64" => "aarch64-unknown-linux-musl",
+        "arm" => "armv7-unknown-linux-musleabihf",
+        "x86" => "i686-unknown-linux-musl",
+        _ => return Err("архитектура не поддерживается".into()),
+    };
+    let sums = command(
+        "curl",
+        &[
+            "-q",
+            "-fsSL",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "15",
+            RELEASE_SUMS,
+        ],
+    )?;
+    let latest = release_hash(&sums, &format!("relay-tui-{target}"))
+        .ok_or("в релизе нет корректной контрольной суммы")?;
+    let running = fs::File::open("/proc/self/exe").map_err(|e| e.to_string())?;
+    let local = Command::new("sha256sum")
+        .stdin(running)
+        .output()
+        .map_err(|e| format!("sha256sum: {e}"))?;
+    if !local.status.success() {
+        return Err("не удалось вычислить SHA-256".into());
+    }
+    let local = String::from_utf8_lossy(&local.stdout);
+    Ok(local.split_whitespace().next() != Some(latest.as_str()))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Proto {
@@ -433,6 +487,8 @@ struct App {
     firewall_error: Option<String>,
     message: String,
     confirm_delete: bool,
+    update: String,
+    update_check: Option<Receiver<Result<bool, String>>>,
 }
 
 impl App {
@@ -440,7 +496,9 @@ impl App {
         let access = if !cfg!(target_os = "linux") {
             Some("Для управления правилами нужен Linux.".into())
         } else if !matches!(command("id", &["-u"]), Ok(uid) if uid.trim() == "0") {
-            Some("Только просмотр. Для управления: sudo ./relay-tui".into())
+            Some(
+                "Только просмотр. Для управления установи от root: /usr/local/bin/relay-tui".into(),
+            )
         } else {
             None
         };
@@ -458,9 +516,38 @@ impl App {
             firewall_error: None,
             message: String::new(),
             confirm_delete: false,
+            update: String::new(),
+            update_check: None,
         };
         app.refresh();
+        app.start_update_check();
         app
+    }
+
+    fn start_update_check(&mut self) {
+        if !cfg!(target_os = "linux") || self.update_check.is_some() {
+            return;
+        }
+        let (send, receive) = mpsc::channel();
+        self.update = "Проверка обновлений…".into();
+        self.update_check = Some(receive);
+        thread::spawn(move || {
+            let _ = send.send(check_update());
+        });
+    }
+
+    fn poll_update(&mut self) {
+        let Some(check) = &self.update_check else {
+            return;
+        };
+        self.update = match check.try_recv() {
+            Ok(Ok(false)) => "Установлен актуальный билд".into(),
+            Ok(Ok(true)) => "Доступен другой билд из последнего релиза. Запусти install.sh.".into(),
+            Ok(Err(e)) => format!("Не удалось проверить обновления: {e}"),
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => "Проверка обновлений прервана".into(),
+        };
+        self.update_check = None;
     }
 
     fn refresh(&mut self) {
@@ -674,6 +761,7 @@ impl App {
                     String::new()
                 };
             }
+            KeyCode::Char('u') => self.start_update_check(),
             KeyCode::Char('r') => {
                 self.refresh();
                 self.message.clear();
@@ -718,9 +806,11 @@ impl Message for Result<&str, String> {
 
 fn ui(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let [title, notice, body, message, keys] = Layout::vertical([
+    let show_update = app.editor.is_none() && !app.update.is_empty();
+    let [title, notice, update, body, message, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(2),
+        Constraint::Length(if show_update { 1 } else { 0 }),
         Constraint::Min(1),
         Constraint::Length(2),
         Constraint::Length(3),
@@ -786,6 +876,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
         );
     } else {
         frame.render_widget(Paragraph::new("Релеи").bold(), title);
+        if show_update {
+            frame.render_widget(Paragraph::new(app.update.as_str()), update);
+        }
         if app.routes.is_empty() {
             frame.render_widget(Paragraph::new("Список пуст. N — добавить релей."), body);
         } else {
@@ -816,7 +909,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
         frame.render_widget(
             Paragraph::new(
                 "↑↓ выбор · N добавить · Enter/E править · A применить · X отключить
-Del удалить · R обновить · P сохранить правила · Q/Esc выход",
+Del удалить · R обновить список · P сохранить правила
+U проверить обновления · Q/Esc выход",
             )
             .wrap(Wrap { trim: true }),
             keys,
@@ -828,7 +922,11 @@ fn main() -> io::Result<()> {
     let mut app = App::new();
     let mut terminal: DefaultTerminal = ratatui::init();
     let result = (|| loop {
+        app.poll_update();
         terminal.draw(|frame| ui(frame, &mut app))?;
+        if app.update_check.is_some() && !event::poll(Duration::from_millis(150))? {
+            continue;
+        }
         if let Event::Key(key) = event::read()? {
             if app.key(key) {
                 return Ok(());
@@ -842,6 +940,16 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_checksum_requires_one_valid_matching_line() {
+        let hash = "a".repeat(64);
+        let entry = format!("{hash}  relay-tui-arm");
+        assert_eq!(release_hash(&entry, "relay-tui-arm"), Some(hash));
+        assert!(release_hash(&entry, "relay-tui-other").is_none());
+        assert!(release_hash(&format!("{entry}\n{entry}"), "relay-tui-arm").is_none());
+        assert!(release_hash("invalid  relay-tui-arm", "relay-tui-arm").is_none());
+    }
 
     #[test]
     fn imports_both_protocols_and_rejects_invalid_input() {
