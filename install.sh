@@ -12,20 +12,23 @@ case "$arch" in
     *) fail "Неподдерживаемая архитектура: $arch" ;;
 esac
 
-if (( EUID == 0 )); then
-    bin_dir=/usr/local/bin
-else
-    bin_dir="${HOME:?HOME не задан}/.local/bin"
+{ : </dev/tty; } 2>/dev/null || fail 'Для запуска relay-tui нужен интерактивный терминал.'
+as_root=()
+if (( EUID != 0 )); then
+    command -v sudo >/dev/null || fail 'sudo не установлен. Запусти установщик от root.'
+    sudo -v </dev/tty || fail 'Не удалось получить права через sudo. Запусти установщик от root.'
+    as_root=(sudo --)
 fi
+bin_dir=/usr/local/bin
 bin="$bin_dir/relay-tui"
-mkdir -p -- "$bin_dir"
+"${as_root[@]}" mkdir -p -- "$bin_dir" || fail "Не удалось подготовить $bin_dir с правами root."
 if [[ -e $bin || -L $bin ]]; then
     [[ -f $bin && ! -L $bin ]] || fail "$bin не является обычным файлом. Установка отменена."
 fi
 
 base=https://github.com/oshinono/vps-relay-setup/releases/latest/download
 name="relay-tui-$target"
-tmp=$(mktemp -d "$bin_dir/.relay-tui.XXXXXXXX")
+tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
 
 fetch() { curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time "$2" "$base/$1" -o "$tmp/$1"; }
@@ -37,9 +40,15 @@ if [[ -f $bin ]] && (cd "$bin_dir" && printf '%s  relay-tui\n' "$hash" | sha256s
 else
     fetch "$name" 120
     printf '%s  %s\n' "$hash" "$name" | (cd "$tmp" && sha256sum -c -)
-    chmod 755 "$tmp/$name"
-    mv -fT -- "$tmp/$name" "$bin"
+    "${as_root[@]}" sh -c '
+        set -eu
+        staged=$(mktemp "$1.XXXXXXXX")
+        trap '\''rm -f -- "$staged"'\'' EXIT
+        install -m 755 -- "$2" "$staged"
+        printf "%s  %s\n" "$3" "$staged" | sha256sum --status -c -
+        mv -fT -- "$staged" "$1"
+    ' sh "$bin" "$tmp/$name" "$hash" || fail "Не удалось установить $bin с правами root."
     printf 'Установлен %s (%s)\n' "$bin" "$arch"
 fi
 [[ -x $bin ]] || fail "$bin не исполняемый. Выполни: chmod +x '$bin'"
-"$bin" </dev/tty
+"${as_root[@]}" "$bin" </dev/tty || fail 'Не удалось запустить relay-tui с правами root. См. ошибку выше.'
