@@ -15,7 +15,8 @@ use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout},
     style::{Color, Style, Stylize},
-    widgets::{List, ListItem, ListState, Paragraph, Wrap},
+    text::{Line, Span},
+    widgets::{Block, BorderType, List, ListItem, ListState, Paragraph, Wrap},
     DefaultTerminal, Frame,
 };
 
@@ -804,6 +805,23 @@ impl Message for Result<&str, String> {
     }
 }
 
+fn shortcuts(items: &[(&str, &str, Color)]) -> Line<'static> {
+    Line::from(
+        items
+            .iter()
+            .flat_map(|&(key, label, color)| {
+                [
+                    Span::styled(
+                        format!(" {key} "),
+                        Style::default().fg(Color::Black).bg(color).bold(),
+                    ),
+                    Span::raw(format!(" {label}  ")),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn ui(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let show_update = app.editor.is_none() && !app.update.is_empty();
@@ -813,7 +831,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
         Constraint::Length(if show_update { 1 } else { 0 }),
         Constraint::Min(1),
         Constraint::Length(2),
-        Constraint::Length(3),
+        Constraint::Length(if app.editor.is_none() && area.width < 60 {
+            5
+        } else {
+            3
+        }),
     ])
     .areas(area);
     let warning = app
@@ -833,10 +855,12 @@ fn ui(frame: &mut Frame, app: &mut App) {
     if let Some(edit) = &app.editor {
         frame.render_widget(
             Paragraph::new(if edit.original.is_some() {
-                "Редактировать релей"
+                " ◇  Редактор релея "
             } else {
-                "Новый релей"
+                " +  Новый релей "
             })
+            .fg(Color::Black)
+            .bg(Color::Cyan)
             .bold(),
             title,
         );
@@ -870,36 +894,61 @@ fn ui(frame: &mut Frame, app: &mut App) {
             }
         }
         frame.render_widget(
-            Paragraph::new("Tab/↑↓ поле · ←→ курсор/протокол · Enter сохранить · Esc отмена")
-                .wrap(Wrap { trim: true }),
+            Paragraph::new(vec![
+                shortcuts(&[
+                    ("Tab/↑↓", "поле", Color::Cyan),
+                    ("←→", "курсор / протокол", Color::Cyan),
+                ]),
+                shortcuts(&[
+                    ("Enter", "сохранить", Color::Green),
+                    ("Esc", "отмена", Color::Gray),
+                ]),
+            ])
+            .wrap(Wrap { trim: true }),
             keys,
         );
     } else {
-        frame.render_widget(Paragraph::new("Релеи").bold(), title);
+        frame.render_widget(
+            Paragraph::new(format!(" ◈  Релеи  /  {} ", app.routes.len()))
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .bold(),
+            title,
+        );
+        let card = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" Маршруты ");
         if show_update {
             frame.render_widget(Paragraph::new(app.update.as_str()), update);
         }
         if app.routes.is_empty() {
-            frame.render_widget(Paragraph::new("Список пуст. N — добавить релей."), body);
+            frame.render_widget(
+                Paragraph::new("Список пуст. N — добавить релей.").block(card),
+                body,
+            );
         } else {
             let items = app.routes.iter().zip(&app.statuses).map(|(cfg, status)| {
                 let (label, color) = match status {
-                    Status::Off => ("Не применён", Color::Gray),
-                    Status::On => ("Применён", Color::Green),
-                    Status::Partial => ("Частично", Color::Yellow),
-                    Status::Unknown => ("Статус неизвестен", Color::Yellow),
+                    Status::Off => ("○ Не применён", Color::Gray),
+                    Status::On => ("● Применён", Color::Green),
+                    Status::Partial => ("◐ Частично", Color::Yellow),
+                    Status::Unknown => ("? Нет статуса", Color::Yellow),
                 };
-                ListItem::new(format!(
-                    "{label} | {} :{} → {}:{}",
-                    cfg.proto.label(),
-                    cfg.listen_port,
-                    cfg.ip,
-                    cfg.main_port
-                ))
-                .style(Style::default().fg(color))
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{label:15}"), Style::default().fg(color).bold()),
+                    Span::raw(format!(
+                        " {} :{} → {}:{}",
+                        cfg.proto.label(),
+                        cfg.listen_port,
+                        cfg.ip,
+                        cfg.main_port
+                    )),
+                ]))
             });
             frame.render_stateful_widget(
                 List::new(items)
+                    .block(card)
                     .highlight_symbol("› ")
                     .highlight_style(Style::default().reversed()),
                 body,
@@ -907,11 +956,24 @@ fn ui(frame: &mut Frame, app: &mut App) {
             );
         }
         frame.render_widget(
-            Paragraph::new(
-                "↑↓ выбор · N добавить · Enter/E править · A применить · X отключить
-Del удалить · R обновить список · P сохранить правила
-U проверить обновления · Q/Esc выход",
-            )
+            Paragraph::new(vec![
+                shortcuts(&[
+                    ("↑↓", "выбор", Color::Gray),
+                    ("N", "добавить", Color::Cyan),
+                    ("Enter/E", "править", Color::Cyan),
+                ]),
+                shortcuts(&[
+                    ("A", "применить", Color::Green),
+                    ("X", "отключить", Color::Yellow),
+                    ("Del", "удалить", Color::Red),
+                    ("P", "сохранить", Color::Green),
+                ]),
+                shortcuts(&[
+                    ("R", "обновить список", Color::Gray),
+                    ("U", "проверить обновления", Color::Cyan),
+                    ("Q/Esc", "выход", Color::Gray),
+                ]),
+            ])
             .wrap(Wrap { trim: true }),
             keys,
         );
