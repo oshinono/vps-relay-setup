@@ -1,29 +1,25 @@
-//! relay-tui — TUI для настройки relay-сервера (способ A):
-//! клиент → relay (этот сервер) → основной VPS. Трафик не расшифровывается,
-//! просто пробрасывается через iptables DNAT. Запускать от root.
+//! relay-tui — IPv4 TCP/UDP relay через iptables DNAT.
 
 use std::{
     fs,
-    net::{Ipv4Addr, SocketAddr, TcpStream},
+    io::{self, Write},
+    net::Ipv4Addr,
+    path::Path,
     process::Command,
-    time::Duration,
 };
 
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    layout::{Alignment, Constraint, Layout},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, BorderType, Paragraph, Wrap},
+    layout::{Constraint, Layout},
+    style::{Color, Style, Stylize},
+    widgets::{List, ListItem, ListState, Paragraph, Wrap},
     DefaultTerminal, Frame,
 };
 
-/// Метка в комментариях правил: по ней находим и удаляем только свои правила.
 const TAG: &str = "relay-tui";
+const CONFIG: &str = "/etc/relay-tui/routes";
 
-// ───────────────────────── модель ─────────────────────────
-
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Proto {
     Tcp,
     Udp,
@@ -59,78 +55,12 @@ impl Proto {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Config {
     ip: Ipv4Addr,
     main_port: u16,
     listen_port: u16,
     proto: Proto,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Lvl {
-    Info,
-    Ok,
-    Warn,
-    Err,
-    Out,
-}
-
-#[derive(Clone, Copy)]
-enum Action {
-    Apply,
-    Remove,
-    Status,
-    Test,
-    Persist,
-}
-
-const BUTTONS: [(&str, &str, Action); 5] = [
-    ("F5", "Применить правила", Action::Apply),
-    ("F6", "Удалить правила", Action::Remove),
-    ("F7", "Показать статус", Action::Status),
-    ("F8", "Проверить основной VPS", Action::Test),
-    ("F9", "Сохранить после перезагрузки", Action::Persist),
-];
-
-const F_IP: usize = 0;
-const F_MAIN_PORT: usize = 1;
-const F_LISTEN_PORT: usize = 2;
-const F_PROTO: usize = 3;
-const F_BTN0: usize = 4;
-const TOTAL: usize = F_BTN0 + BUTTONS.len();
-
-struct App {
-    main_ip: String,
-    main_port: String,
-    listen_port: String,
-    proto: Proto,
-    focus: usize,
-    log: Vec<(Lvl, String)>,
-    log_offset: usize,
-    is_root: bool,
-    busy: bool,
-    quit: bool,
-}
-
-// ───────────────────────── системные команды ─────────────────────────
-
-fn run<S: AsRef<str>>(args: &[S]) -> (bool, String) {
-    let name: &str = args[0].as_ref();
-    let rest: Vec<&str> = args[1..].iter().map(|a| a.as_ref()).collect();
-    match Command::new(name).args(rest).output() {
-        Ok(o) => {
-            let mut s = String::from_utf8_lossy(&o.stdout).to_string();
-            s.push_str(&String::from_utf8_lossy(&o.stderr));
-            (o.status.success(), s.trim().to_string())
-        }
-        Err(e) => (false, format!("{name}: {e}")),
-    }
-}
-
-fn tail(text: &str, n: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
 }
 
 struct Rule {
@@ -156,8 +86,18 @@ fn rules_for(cfg: &Config, p: &str) -> Vec<Rule> {
             chain: "PREROUTING",
             insert: false,
             spec: s(&[
-                "-p", p, "--dport", &lp, "-m", "comment", "--comment", &cm, "-j", "DNAT",
-                "--to-destination", &to,
+                "-p",
+                p,
+                "--dport",
+                &lp,
+                "-m",
+                "comment",
+                "--comment",
+                &cm,
+                "-j",
+                "DNAT",
+                "--to-destination",
+                &to,
             ]),
         },
         Rule {
@@ -165,7 +105,17 @@ fn rules_for(cfg: &Config, p: &str) -> Vec<Rule> {
             chain: "POSTROUTING",
             insert: false,
             spec: s(&[
-                "-p", p, "-d", &ip, "--dport", &mp, "-m", "comment", "--comment", &cm, "-j",
+                "-p",
+                p,
+                "-d",
+                &ip,
+                "--dport",
+                &mp,
+                "-m",
+                "comment",
+                "--comment",
+                &cm,
+                "-j",
                 "MASQUERADE",
             ]),
         },
@@ -174,7 +124,17 @@ fn rules_for(cfg: &Config, p: &str) -> Vec<Rule> {
             chain: "FORWARD",
             insert: true,
             spec: s(&[
-                "-p", p, "-d", &ip, "--dport", &mp, "-m", "comment", "--comment", &cm, "-j",
+                "-p",
+                p,
+                "-d",
+                &ip,
+                "--dport",
+                &mp,
+                "-m",
+                "comment",
+                "--comment",
+                &cm,
+                "-j",
                 "ACCEPT",
             ]),
         },
@@ -215,610 +175,684 @@ fn ipt(r: &Rule, op: &str) -> Vec<String> {
     v
 }
 
-// ───────────────────────── логика приложения ─────────────────────────
+fn command<S: AsRef<std::ffi::OsStr>>(name: &str, args: &[S]) -> Result<String, String> {
+    let out = Command::new(name)
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|e| format!("{name}: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(format!(
+            "{name}: {}",
+            stderr
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or("команда завершилась с ошибкой")
+        ))
+    }
+}
 
-impl App {
-    fn new() -> Self {
-        let is_root = run(&["id", "-u"]).1 == "0";
-        let mut app = App {
-            main_ip: String::new(),
-            main_port: "443".into(),
-            listen_port: "443".into(),
-            proto: Proto::Tcp,
-            focus: 0,
-            log: vec![],
-            log_offset: 0,
-            is_root,
-            busy: false,
-            quit: false,
+impl Config {
+    fn parse(proto: Proto, route: &str) -> Option<Self> {
+        let (listen, dest) = route.split_once("->")?;
+        let (ip, port) = dest.split_once(':')?;
+        let (listen_port, main_port) = (listen.parse().ok()?, port.parse().ok()?);
+        (listen_port != 0 && main_port != 0).then_some(Self {
+            ip: ip.parse().ok()?,
+            listen_port,
+            main_port,
+            proto,
+        })
+    }
+
+    fn route(self) -> String {
+        format!("{}->{}:{}", self.listen_port, self.ip, self.main_port)
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        self.listen_port == other.listen_port
+            && (self.proto == other.proto
+                || self.proto == Proto::Both
+                || other.proto == Proto::Both)
+    }
+
+    fn rules(self) -> impl Iterator<Item = Rule> {
+        self.proto
+            .names()
+            .into_iter()
+            .flat_map(move |p| rules_for(&self, p))
+    }
+}
+
+fn load_routes(path: &Path) -> Result<Vec<Config>, String> {
+    let data = match fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    data.lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let (proto, route) = line.split_once(' ').unwrap_or_default();
+            Proto::ALL
+                .into_iter()
+                .find(|p| p.label() == proto)
+                .and_then(|p| Config::parse(p, route))
+                .ok_or_else(|| format!("Некорректная строка {} в {}", i + 1, path.display()))
+        })
+        .collect()
+}
+
+fn save_routes(routes: &[Config]) -> io::Result<()> {
+    let path = Path::new(CONFIG);
+    let dir = path.parent().unwrap();
+    fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".routes.{}", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    let result = (|| {
+        for cfg in routes {
+            writeln!(file, "{} {}", cfg.proto.label(), cfg.route())?;
+        }
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+    result
+}
+
+fn discover(rules: &str) -> Vec<Config> {
+    let mut routes: Vec<Config> = Vec::new();
+    for line in rules.lines() {
+        let Some((_, comment)) = line.split_once(" --comment ") else {
+            continue;
         };
-        app.push(Lvl::Info, "Relay-проброс: клиент → этот сервер → основной VPS.");
-        app.push(Lvl::Out, "Заполни параметры слева и нажми F5.");
-        app.push(Lvl::Out, "VLESS/Xray → TCP, AmneziaWG/WireGuard → UDP.");
-        if !is_root {
-            app.push(Lvl::Err, "Нет прав root. Запусти: sudo ./relay-tui");
+        let Some((proto, route)) = comment
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.trim_matches('"').strip_prefix("relay-tui:"))
+            .and_then(|s| s.split_once(':'))
+        else {
+            continue;
+        };
+        let proto = match proto {
+            "tcp" => Proto::Tcp,
+            "udp" => Proto::Udp,
+            _ => continue,
+        };
+        let Some(cfg) = Config::parse(proto, route) else {
+            continue;
+        };
+        if let Some(existing) = routes.iter_mut().find(|r| {
+            r.ip == cfg.ip && r.listen_port == cfg.listen_port && r.main_port == cfg.main_port
+        }) {
+            if existing.proto != proto {
+                existing.proto = Proto::Both;
+            }
+        } else {
+            routes.push(cfg);
         }
-        app
+    }
+    routes
+}
+
+fn rule_command(rule: &Rule, op: &str) -> Result<String, String> {
+    command("iptables", &ipt(rule, op)[1..])
+}
+
+fn present(rule: &Rule) -> Result<bool, String> {
+    match rule_command(rule, "-C") {
+        Ok(_) => Ok(true),
+        Err(e) if e.contains("Bad rule (does a matching rule exist in that chain?)") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Status {
+    Off,
+    On,
+    Partial,
+    Unknown,
+}
+
+struct Firewall {
+    forwarding: bool,
+    return_rule: bool,
+}
+
+impl Firewall {
+    fn status(&self, cfg: Config) -> Result<Status, String> {
+        let checks = cfg
+            .rules()
+            .map(|r| present(&r))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(if !checks.contains(&true) {
+            Status::Off
+        } else if !checks.contains(&false) && self.forwarding && self.return_rule {
+            Status::On
+        } else {
+            Status::Partial
+        })
+    }
+}
+
+struct Editor {
+    fields: [String; 3],
+    proto: Proto,
+    focus: usize,
+    cursor: usize,
+    original: Option<usize>,
+}
+
+impl Editor {
+    fn new(original: Option<usize>, cfg: Option<Config>) -> Self {
+        let fields = cfg
+            .map(|c| {
+                [
+                    c.ip.to_string(),
+                    c.main_port.to_string(),
+                    c.listen_port.to_string(),
+                ]
+            })
+            .unwrap_or_else(|| [String::new(), "443".into(), "443".into()]);
+        let cursor = fields[0].len();
+        Self {
+            fields,
+            proto: cfg.map_or(Proto::Tcp, |c| c.proto),
+            focus: 0,
+            cursor,
+            original,
+        }
     }
 
-    fn push(&mut self, lvl: Lvl, text: impl AsRef<str>) {
-        for line in text.as_ref().lines() {
-            self.log.push((lvl, line.to_string()));
-        }
-        if self.log.len() > 1000 {
-            self.log.drain(..200);
-        }
-        self.log_offset = 0;
+    fn next(&mut self, delta: usize) {
+        self.focus = (self.focus + delta) % 4;
+        self.cursor = self.fields.get(self.focus).map_or(0, String::len);
     }
 
-    fn field_mut(&mut self) -> Option<(&mut String, bool)> {
-        match self.focus {
-            F_IP => Some((&mut self.main_ip, true)),
-            F_MAIN_PORT => Some((&mut self.main_port, false)),
-            F_LISTEN_PORT => Some((&mut self.listen_port, false)),
-            _ => None,
-        }
-    }
-
-    fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
-        if key.kind != KeyEventKind::Press {
-            return None;
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.quit = true;
-            return None;
-        }
-        match key.code {
-            KeyCode::Esc => self.quit = true,
-            KeyCode::Tab | KeyCode::Down => self.focus = (self.focus + 1) % TOTAL,
-            KeyCode::BackTab | KeyCode::Up => self.focus = (self.focus + TOTAL - 1) % TOTAL,
-            KeyCode::F(5) => return Some(Action::Apply),
-            KeyCode::F(6) => return Some(Action::Remove),
-            KeyCode::F(7) => return Some(Action::Status),
-            KeyCode::F(8) => return Some(Action::Test),
-            KeyCode::F(9) => return Some(Action::Persist),
-            KeyCode::PageUp => self.log_offset += 5,
-            KeyCode::PageDown => self.log_offset = self.log_offset.saturating_sub(5),
-            KeyCode::Enter => {
-                if self.focus >= F_BTN0 {
-                    return Some(BUTTONS[self.focus - F_BTN0].2);
+    fn input(&mut self, code: KeyCode) {
+        if let Some(value) = self.fields.get_mut(self.focus) {
+            let max = if self.focus == 0 { 15 } else { 5 };
+            match code {
+                KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
+                KeyCode::Right => self.cursor = (self.cursor + 1).min(value.len()),
+                KeyCode::Home => self.cursor = 0,
+                KeyCode::End => self.cursor = value.len(),
+                KeyCode::Backspace if self.cursor > 0 => {
+                    self.cursor -= 1;
+                    value.remove(self.cursor);
                 }
-                self.focus = (self.focus + 1) % TOTAL;
-            }
-            KeyCode::Left if self.focus == F_PROTO => self.proto = self.proto.cycle(-1),
-            KeyCode::Right | KeyCode::Char(' ') if self.focus == F_PROTO => {
-                self.proto = self.proto.cycle(1)
-            }
-            KeyCode::Backspace => {
-                if let Some((text, _)) = self.field_mut() {
-                    text.pop();
+                KeyCode::Delete if self.cursor < value.len() => {
+                    value.remove(self.cursor);
                 }
-            }
-            KeyCode::Char(c) => {
-                if let Some((text, is_ip)) = self.field_mut() {
-                    let allowed = if is_ip {
-                        c.is_ascii_digit() || c == '.'
-                    } else {
-                        c.is_ascii_digit()
-                    };
-                    let max = if is_ip { 15 } else { 5 };
-                    if allowed && text.len() < max {
-                        text.push(c);
-                    }
+                KeyCode::Char(c)
+                    if value.len() < max
+                        && (c.is_ascii_digit() || (self.focus == 0 && c == '.')) =>
+                {
+                    value.insert(self.cursor, c);
+                    self.cursor += 1;
                 }
+                _ => {}
             }
-            _ => {}
+        } else {
+            match code {
+                KeyCode::Left => self.proto = self.proto.cycle(-1),
+                KeyCode::Right | KeyCode::Char(' ') => self.proto = self.proto.cycle(1),
+                _ => {}
+            }
         }
-        None
     }
 
     fn config(&self) -> Result<Config, String> {
-        let ip: Ipv4Addr = self
-            .main_ip
-            .parse()
-            .map_err(|_| "Некорректный IPv4 основного VPS".to_string())?;
-        let main_port: u16 = self
-            .main_port
-            .parse()
-            .ok()
-            .filter(|p| *p > 0)
-            .ok_or("Некорректный порт основного VPS")?;
-        let listen_port: u16 = self
-            .listen_port
-            .parse()
-            .ok()
-            .filter(|p| *p > 0)
-            .ok_or("Некорректный порт на relay")?;
-        Ok(Config {
-            ip,
-            main_port,
-            listen_port,
-            proto: self.proto,
-        })
-    }
-
-    fn need_root(&mut self) -> bool {
-        if !self.is_root {
-            self.push(Lvl::Err, "Нужны права root: запусти `sudo ./relay-tui`");
-        }
-        self.is_root
-    }
-
-    fn exec(&mut self, action: Action) {
-        self.push(Lvl::Info, "────────────────────────────");
-        match action {
-            Action::Apply => self.apply(),
-            Action::Remove => self.remove(),
-            Action::Status => self.status(),
-            Action::Test => self.test(),
-            Action::Persist => self.persist(),
-        }
-    }
-
-    fn ensure(&mut self, r: &Rule) {
-        let name = format!("{}/{}", r.table, r.chain);
-        if run(&ipt(r, "-C")).0 {
-            self.push(Lvl::Info, format!("{name}: правило уже есть"));
-            return;
-        }
-        let op = if r.insert { "-I" } else { "-A" };
-        let (ok, out) = run(&ipt(r, op));
-        if ok {
-            self.push(Lvl::Ok, format!("{name}: добавлено"));
-        } else {
-            self.push(Lvl::Err, format!("{name}: {out}"));
-        }
-    }
-
-    fn apply(&mut self) {
-        if !self.need_root() {
-            return;
-        }
-        let cfg = match self.config() {
-            Ok(c) => c,
-            Err(e) => {
-                self.push(Lvl::Err, e);
-                return;
-            }
-        };
+        let [ip, target, listen] = &self.fields;
+        let cfg = Config::parse(self.proto, &format!("{listen}->{ip}:{target}"))
+            .ok_or("Нужны IPv4-адрес и порты от 1 до 65535.")?;
         if cfg.listen_port == 22 {
-            self.push(
-                Lvl::Err,
-                "Порт 22 на relay — это твой SSH, пробросом его не перехватываем. Выбери другой.",
-            );
-            return;
+            return Err("Порт 22 зарезервирован для SSH.".into());
         }
+        Ok(cfg)
+    }
+}
 
-        let (ok, out) = run(&["sysctl", "-w", "net.ipv4.ip_forward=1"]);
-        if ok {
-            self.push(Lvl::Ok, "ip_forward включён");
+struct App {
+    routes: Vec<Config>,
+    statuses: Vec<Status>,
+    list: ListState,
+    editor: Option<Editor>,
+    access: Option<String>,
+    config_error: Option<String>,
+    firewall_error: Option<String>,
+    message: String,
+    confirm_delete: bool,
+}
+
+impl App {
+    fn new() -> Self {
+        let access = if !cfg!(target_os = "linux") {
+            Some("Для управления правилами нужен Linux.".into())
+        } else if !matches!(command("id", &["-u"]), Ok(uid) if uid.trim() == "0") {
+            Some("Только просмотр. Для управления: sudo ./relay-tui".into())
         } else {
-            self.push(Lvl::Err, format!("sysctl: {out}"));
-            return;
-        }
-        match fs::write("/etc/sysctl.d/99-relay.conf", "net.ipv4.ip_forward=1\n") {
-            Ok(_) => self.push(Lvl::Ok, "ip_forward сохранён в /etc/sysctl.d/99-relay.conf"),
-            Err(e) => self.push(Lvl::Warn, format!("Не записал sysctl.d: {e}")),
-        }
+            None
+        };
+        let (routes, config_error) = match load_routes(Path::new(CONFIG)) {
+            Ok(routes) => (routes, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        let mut app = Self {
+            routes,
+            statuses: Vec::new(),
+            list: ListState::default(),
+            editor: None,
+            access,
+            config_error,
+            firewall_error: None,
+            message: String::new(),
+            confirm_delete: false,
+        };
+        app.refresh();
+        app
+    }
 
-        for p in cfg.proto.names() {
-            self.push(
-                Lvl::Info,
-                format!(
-                    "{}: :{} → {}:{}",
-                    p.to_uppercase(),
+    fn refresh(&mut self) {
+        self.firewall_error = None;
+        self.statuses = vec![Status::Unknown; self.routes.len()];
+        if self.access.is_none() {
+            if let Err(e) = self.read_firewall() {
+                self.firewall_error = Some(e);
+            }
+        }
+        let selected = self
+            .list
+            .selected()
+            .unwrap_or(0)
+            .min(self.routes.len().saturating_sub(1));
+        self.list
+            .select((!self.routes.is_empty()).then_some(selected));
+    }
+
+    fn read_firewall(&mut self) -> Result<(), String> {
+        let nat = command("iptables", &["-w", "-t", "nat", "-S"])?;
+        let filter = command("iptables", &["-w", "-S", "FORWARD"])?;
+        for mut cfg in discover(&format!("{nat}\n{filter}")) {
+            let mut missing = [Proto::Tcp, Proto::Udp].into_iter().filter(|&proto| {
+                let single = Config { proto, ..cfg };
+                single.overlaps(cfg)
+                    && !self.routes.iter().any(|r| {
+                        r.ip == cfg.ip && r.main_port == cfg.main_port && r.overlaps(single)
+                    })
+            });
+            if let Some(proto) = missing.next() {
+                cfg.proto = if missing.next().is_some() {
+                    Proto::Both
+                } else {
+                    proto
+                };
+                self.routes.push(cfg);
+            }
+        }
+        self.statuses.resize(self.routes.len(), Status::Unknown);
+        let firewall = Firewall {
+            forwarding: command("sysctl", &["-n", "net.ipv4.ip_forward"])?.trim() == "1",
+            return_rule: present(&conntrack_rule())?,
+        };
+        for (status, cfg) in self.statuses.iter_mut().zip(&self.routes) {
+            *status = firewall.status(*cfg)?;
+        }
+        Ok(())
+    }
+
+    fn writable(&self) -> Result<(), String> {
+        if let Some(e) = self
+            .access
+            .as_ref()
+            .or(self.config_error.as_ref())
+            .or(self.firewall_error.as_ref())
+        {
+            Err(e.clone())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn store(&mut self, routes: Vec<Config>) -> Result<(), String> {
+        save_routes(&routes).map_err(|e| format!("Не сохранил {CONFIG}: {e}"))?;
+        self.routes = routes;
+        Ok(())
+    }
+
+    fn save_editor(&mut self) -> Result<&'static str, String> {
+        self.writable()?;
+        let edit = self.editor.as_ref().unwrap();
+        let cfg = edit.config()?;
+        let mut routes = self.routes.clone();
+        if routes
+            .iter()
+            .enumerate()
+            .any(|(i, c)| Some(i) != edit.original && c.overlaps(cfg))
+        {
+            return Err("Этот входной порт уже занят релеем с тем же протоколом.".into());
+        }
+        let index = edit.original.unwrap_or(routes.len());
+        if let Some(old) = routes.get_mut(index) {
+            if *old != cfg && !matches!(self.statuses[index], Status::Off) {
+                return Err("Сначала отключи релей в списке, затем измени его.".into());
+            }
+            *old = cfg;
+        } else {
+            routes.push(cfg);
+        }
+        self.store(routes)?;
+        self.editor = None;
+        self.list.select(Some(index));
+        self.refresh();
+        Ok("Маршрут сохранён. A — применить.")
+    }
+
+    fn toggle(&mut self, enable: bool) -> Result<&'static str, String> {
+        self.refresh();
+        self.writable()?;
+        let i = self.list.selected().ok_or("Нет выбранного релея.")?;
+        let cfg = self.routes[i];
+        save_routes(&self.routes).map_err(|e| format!("Не сохранил {CONFIG}: {e}"))?;
+        if enable {
+            if cfg.listen_port == 22 {
+                return Err("Порт 22 зарезервирован для SSH.".into());
+            }
+            if self
+                .routes
+                .iter()
+                .zip(&self.statuses)
+                .enumerate()
+                .any(|(j, (other, status))| {
+                    i != j && other.overlaps(cfg) && !matches!(status, Status::Off)
+                })
+            {
+                return Err("Входной порт уже занят активным релеем с тем же протоколом.".into());
+            }
+            command("sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
+            fs::write(
+                "/etc/sysctl.d/99-relay.conf",
+                "net.ipv4.ip_forward=1
+",
+            )
+            .map_err(|e| format!("Не сохранил ip_forward: {e}"))?;
+            for r in cfg.rules().chain(std::iter::once(conntrack_rule())) {
+                if !present(&r)? {
+                    rule_command(&r, if r.insert { "-I" } else { "-A" })?;
+                }
+            }
+            Ok("Правила применены. P — сохранить после перезагрузки.")
+        } else {
+            for r in cfg.rules() {
+                for _ in 0..10 {
+                    if !present(&r)? {
+                        break;
+                    }
+                    rule_command(&r, "-D")?;
+                }
+                if present(&r)? {
+                    return Err("Остались дубликаты правил. Повтори отключение.".into());
+                }
+            }
+            Ok("Правила отключены. P — сохранить после перезагрузки.")
+        }
+    }
+
+    fn delete(&mut self) -> Result<&'static str, String> {
+        self.refresh();
+        self.writable()?;
+        let i = self.list.selected().ok_or("Нет выбранного релея.")?;
+        if !matches!(self.statuses[i], Status::Off) {
+            return Err("Сначала отключи правила клавишей X.".into());
+        }
+        let mut routes = self.routes.clone();
+        routes.remove(i);
+        self.store(routes)?;
+        self.refresh();
+        Ok("Маршрут удалён.")
+    }
+
+    fn key(&mut self, key: KeyEvent) -> bool {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return false;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return true;
+        }
+        if let Some(editor) = &mut self.editor {
+            match key.code {
+                KeyCode::Esc => {
+                    self.editor = None;
+                    self.message.clear();
+                }
+                KeyCode::Enter if key.kind == KeyEventKind::Press => {
+                    self.refresh();
+                    self.message = self.save_editor().unwrap_or_else_message();
+                }
+                KeyCode::Tab | KeyCode::Down => editor.next(1),
+                KeyCode::BackTab | KeyCode::Up => editor.next(3),
+                code => editor.input(code),
+            }
+            return false;
+        }
+        if self.confirm_delete {
+            self.confirm_delete = false;
+            self.message = if key.code == KeyCode::Char('y') && key.kind == KeyEventKind::Press {
+                self.delete().unwrap_or_else_message()
+            } else {
+                String::new()
+            };
+            return false;
+        }
+        let i = self.list.selected().unwrap_or(0);
+        if key.kind == KeyEventKind::Repeat && !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return true,
+            KeyCode::Up if i > 0 => self.list.select(Some(i - 1)),
+            KeyCode::Down if i + 1 < self.routes.len() => self.list.select(Some(i + 1)),
+            KeyCode::Char('n') => {
+                self.editor = Some(Editor::new(None, None));
+                self.message.clear();
+            }
+            KeyCode::Enter | KeyCode::Char('e') if i < self.routes.len() => {
+                self.editor = Some(Editor::new(Some(i), Some(self.routes[i])));
+                self.message = if matches!(self.statuses[i], Status::On | Status::Partial) {
+                    "Чтобы изменить активный релей, сначала отключи его (X).".into()
+                } else {
+                    String::new()
+                };
+            }
+            KeyCode::Char('r') => {
+                self.refresh();
+                self.message.clear();
+            }
+            KeyCode::Char('a' | 'x') => {
+                self.message = self
+                    .toggle(key.code == KeyCode::Char('a'))
+                    .unwrap_or_else_message();
+                self.refresh();
+            }
+            KeyCode::Delete if i < self.routes.len() => {
+                self.confirm_delete = true;
+                self.message = "Удалить выбранный маршрут? Y — да · Esc — отмена".into();
+            }
+            KeyCode::Char('p') => {
+                self.message = self
+                    .writable()
+                    .and_then(|()| {
+                        command("netfilter-persistent", &["save"])
+                            .map(|_| "Правила сохранены после перезагрузки.")
+                            .map_err(|e| {
+                                format!("{e}. На Debian/Ubuntu нужен пакет iptables-persistent.")
+                            })
+                    })
+                    .unwrap_or_else_message();
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
+trait Message {
+    fn unwrap_or_else_message(self) -> String;
+}
+
+impl Message for Result<&str, String> {
+    fn unwrap_or_else_message(self) -> String {
+        self.map(str::to_owned).unwrap_or_else(|e| e)
+    }
+}
+
+fn ui(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    let [title, notice, body, message, keys] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(2),
+        Constraint::Length(3),
+    ])
+    .areas(area);
+    let warning = app
+        .access
+        .as_deref()
+        .or(app.config_error.as_deref())
+        .or(app.firewall_error.as_deref())
+        .unwrap_or("");
+    frame.render_widget(
+        Paragraph::new(warning).yellow().wrap(Wrap { trim: true }),
+        notice,
+    );
+    frame.render_widget(
+        Paragraph::new(app.message.as_str()).wrap(Wrap { trim: true }),
+        message,
+    );
+    if let Some(edit) = &app.editor {
+        frame.render_widget(
+            Paragraph::new(if edit.original.is_some() {
+                "Редактировать релей"
+            } else {
+                "Новый релей"
+            })
+            .bold(),
+            title,
+        );
+        let labels = [
+            "IPv4 конечного VPS",
+            "Порт конечного VPS",
+            "Входной порт релея",
+            "Протокол",
+        ];
+        let rows = Layout::vertical([Constraint::Length(1); 4]).split(body);
+        for (i, label) in labels.iter().enumerate() {
+            let value = edit
+                .fields
+                .get(i)
+                .map_or(edit.proto.label(), String::as_str);
+            let prefix = format!("{} {label}: ", if i == edit.focus { '›' } else { ' ' });
+            let x = rows[i]
+                .x
+                .saturating_add((prefix.chars().count() + edit.cursor) as u16);
+            let style = if i == edit.focus {
+                Style::default().fg(Color::Cyan).bold()
+            } else {
+                Style::default()
+            };
+            frame.render_widget(
+                Paragraph::new(format!("{prefix}{value}")).style(style),
+                rows[i],
+            );
+            if i == edit.focus && i < 3 && rows[i].height > 0 && x < rows[i].right() {
+                frame.set_cursor_position((x, rows[i].y));
+            }
+        }
+        frame.render_widget(
+            Paragraph::new("Tab/↑↓ поле · ←→ курсор/протокол · Enter сохранить · Esc отмена")
+                .wrap(Wrap { trim: true }),
+            keys,
+        );
+    } else {
+        frame.render_widget(Paragraph::new("Релеи").bold(), title);
+        if app.routes.is_empty() {
+            frame.render_widget(Paragraph::new("Список пуст. N — добавить релей."), body);
+        } else {
+            let items = app.routes.iter().zip(&app.statuses).map(|(cfg, status)| {
+                let (label, color) = match status {
+                    Status::Off => ("Не применён", Color::Gray),
+                    Status::On => ("Применён", Color::Green),
+                    Status::Partial => ("Частично", Color::Yellow),
+                    Status::Unknown => ("Статус неизвестен", Color::Yellow),
+                };
+                ListItem::new(format!(
+                    "{label} | {} :{} → {}:{}",
+                    cfg.proto.label(),
                     cfg.listen_port,
                     cfg.ip,
                     cfg.main_port
-                ),
-            );
-            for r in rules_for(&cfg, p) {
-                self.ensure(&r);
-            }
-        }
-        self.ensure(&conntrack_rule());
-
-        let (ok, out) = run(&["ufw", "status"]);
-        if ok && out.contains("Status: active") {
-            self.push(
-                Lvl::Warn,
-                "ufw активен: разреши порт (ufw allow) и поставь DEFAULT_FORWARD_POLICY=\"ACCEPT\" в /etc/default/ufw.",
+                ))
+                .style(Style::default().fg(color))
+            });
+            frame.render_stateful_widget(
+                List::new(items)
+                    .highlight_symbol("› ")
+                    .highlight_style(Style::default().reversed()),
+                body,
+                &mut app.list,
             );
         }
-
-        self.push(Lvl::Ok, "Готово.");
-        self.push(
-            Lvl::Info,
-            format!(
-                "В Happ замени адрес сервера на IP этого relay, порт — {}. Остальное не трогай.",
-                cfg.listen_port
-            ),
+        frame.render_widget(
+            Paragraph::new(
+                "↑↓ выбор · N добавить · Enter/E править · A применить · X отключить
+Del удалить · R обновить · P сохранить правила · Q/Esc выход",
+            )
+            .wrap(Wrap { trim: true }),
+            keys,
         );
-        self.push(Lvl::Warn, "Чтобы правила пережили перезагрузку — нажми F9.");
-    }
-
-    fn remove(&mut self) {
-        if !self.need_root() {
-            return;
-        }
-        let cfg = match self.config() {
-            Ok(c) => c,
-            Err(e) => {
-                self.push(Lvl::Err, e);
-                return;
-            }
-        };
-        let mut removed = 0;
-        for p in cfg.proto.names() {
-            for r in rules_for(&cfg, p) {
-                for _ in 0..10 {
-                    if !run(&ipt(&r, "-C")).0 {
-                        break;
-                    }
-                    if run(&ipt(&r, "-D")).0 {
-                        removed += 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-        if removed > 0 {
-            self.push(Lvl::Ok, format!("Удалено правил: {removed}"));
-            self.push(
-                Lvl::Out,
-                "Общее правило conntrack (FORWARD) и ip_forward не трогаю — они безвредны.",
-            );
-            self.push(Lvl::Warn, "Нажми F9, чтобы сохранить новое состояние.");
-        } else {
-            self.push(Lvl::Warn, "Правил с такими параметрами не найдено.");
-        }
-    }
-
-    fn status(&mut self) {
-        if !self.need_root() {
-            return;
-        }
-        let (_, fwd) = run(&["sysctl", "-n", "net.ipv4.ip_forward"]);
-        if fwd.trim() == "1" {
-            self.push(Lvl::Ok, "ip_forward = 1");
-        } else {
-            self.push(Lvl::Err, "ip_forward = 0 (проброс не работает)");
-        }
-
-        let mut found = false;
-        for (title, args) in [
-            ("nat", vec!["iptables", "-w", "-t", "nat", "-S"]),
-            ("filter", vec!["iptables", "-w", "-S", "FORWARD"]),
-        ] {
-            let (_, out) = run(&args);
-            let mine: Vec<&str> = out.lines().filter(|l| l.contains(TAG)).collect();
-            if !mine.is_empty() {
-                found = true;
-                self.push(Lvl::Info, format!("таблица {title}:"));
-                for l in mine {
-                    self.push(Lvl::Out, l);
-                }
-            }
-        }
-        if !found {
-            self.push(Lvl::Warn, "Правил relay-tui не найдено.");
-        }
-    }
-
-    fn test(&mut self) {
-        let cfg = match self.config() {
-            Ok(c) => c,
-            Err(e) => {
-                self.push(Lvl::Err, e);
-                return;
-            }
-        };
-        let ip = cfg.ip.to_string();
-        let (ok, out) = run(&["ping", "-c", "2", "-W", "2", &ip]);
-        if ok {
-            self.push(Lvl::Ok, format!("ping {ip}: отвечает"));
-            self.push(Lvl::Out, tail(&out, 2));
-        } else {
-            self.push(
-                Lvl::Warn,
-                format!("ping {ip}: нет ответа (ICMP мог быть закрыт, смотри TCP ниже)"),
-            );
-        }
-
-        if cfg.proto != Proto::Udp {
-            let addr: Result<SocketAddr, _> = format!("{ip}:{}", cfg.main_port).parse();
-            match addr {
-                Ok(a) => match TcpStream::connect_timeout(&a, Duration::from_secs(3)) {
-                    Ok(_) => self.push(Lvl::Ok, format!("TCP {ip}:{} доступен", cfg.main_port)),
-                    Err(e) => self.push(
-                        Lvl::Err,
-                        format!("TCP {ip}:{} недоступен: {e}", cfg.main_port),
-                    ),
-                },
-                Err(e) => self.push(Lvl::Err, format!("адрес: {e}")),
-            }
-        }
-        if cfg.proto != Proto::Tcp {
-            self.push(
-                Lvl::Out,
-                "UDP простым подключением не проверить: смотри `awg show` (handshake) на основном VPS.",
-            );
-        }
-    }
-
-    fn persist(&mut self) {
-        if !self.need_root() {
-            return;
-        }
-        if !run(&["sh", "-c", "command -v netfilter-persistent"]).0 {
-            self.push(Lvl::Info, "Ставлю iptables-persistent…");
-            let (ok, out) = run(&[
-                "env",
-                "DEBIAN_FRONTEND=noninteractive",
-                "apt-get",
-                "install",
-                "-y",
-                "iptables-persistent",
-            ]);
-            if !ok {
-                self.push(Lvl::Err, tail(&out, 5));
-                return;
-            }
-            self.push(Lvl::Ok, "iptables-persistent установлен");
-        }
-        let (ok, out) = run(&["netfilter-persistent", "save"]);
-        if ok {
-            self.push(Lvl::Ok, "Правила сохранены, переживут перезагрузку");
-        } else {
-            self.push(Lvl::Err, tail(&out, 5));
-        }
     }
 }
 
-// ───────────────────────── отрисовка ─────────────────────────
-
-fn valid_ip(v: &str) -> bool {
-    v.parse::<Ipv4Addr>().is_ok()
-}
-
-fn valid_port(v: &str) -> bool {
-    v.parse::<u16>().map(|p| p > 0).unwrap_or(false)
-}
-
-fn field_line(app: &App, idx: usize, label: &str, value: &str, valid: bool) -> Line<'static> {
-    let focused = app.focus == idx;
-    let mark = if focused { "▸ " } else { "  " };
-    let label_style = if focused {
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().fg(Color::Gray)
-    };
-    let value_style = if !valid {
-        Style::new().fg(Color::Red)
-    } else if focused {
-        Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().fg(Color::White)
-    };
-    let mut shown = value.to_string();
-    if focused {
-        shown.push('█');
-    }
-    Line::from(vec![
-        Span::styled(format!("{mark}{label:<18}"), label_style),
-        Span::styled(shown, value_style),
-    ])
-}
-
-fn ui(f: &mut Frame, app: &App) {
-    let [head, body, foot] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(12),
-        Constraint::Length(4),
-    ])
-    .areas(f.area());
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)]).areas(body);
-    let [fields_a, btn_a, hint_a] = Layout::vertical([
-        Constraint::Length(6),
-        Constraint::Length(7),
-        Constraint::Min(3),
-    ])
-    .areas(left);
-
-    // шапка
-    let status = if app.busy {
-        Span::styled(" ⏳ выполняется… ", Style::new().fg(Color::Yellow))
-    } else if app.is_root {
-        Span::styled(" root ✔ ", Style::new().fg(Color::Green))
-    } else {
-        Span::styled(" нет root — запусти через sudo ", Style::new().fg(Color::Red))
-    };
-    let title = Line::from(vec![
-        Span::styled(
-            " Relay Setup ",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("· способ A: проброс через iptables DNAT "),
-        status,
-    ]);
-    f.render_widget(
-        Paragraph::new(title)
-            .alignment(Alignment::Center)
-            .block(Block::bordered().border_type(BorderType::Rounded)),
-        head,
-    );
-
-    // поля
-    let mut proto_spans = vec![Span::styled(
-        format!(
-            "{}{:<18}",
-            if app.focus == F_PROTO { "▸ " } else { "  " },
-            "Протокол"
-        ),
-        if app.focus == F_PROTO {
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(Color::Gray)
-        },
-    )];
-    for p in Proto::ALL {
-        let style = if p == app.proto {
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Green)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(Color::DarkGray)
-        };
-        proto_spans.push(Span::styled(format!(" {} ", p.label()), style));
-        proto_spans.push(Span::raw(" "));
-    }
-    let fields = vec![
-        field_line(app, F_IP, "IP основного VPS", &app.main_ip, valid_ip(&app.main_ip)),
-        field_line(
-            app,
-            F_MAIN_PORT,
-            "Порт основного",
-            &app.main_port,
-            valid_port(&app.main_port),
-        ),
-        field_line(
-            app,
-            F_LISTEN_PORT,
-            "Порт на relay",
-            &app.listen_port,
-            valid_port(&app.listen_port),
-        ),
-        Line::from(proto_spans),
-    ];
-    f.render_widget(
-        Paragraph::new(fields).block(
-            Block::bordered()
-                .border_type(BorderType::Rounded)
-                .title(" Параметры "),
-        ),
-        fields_a,
-    );
-
-    // кнопки
-    let buttons: Vec<Line> = BUTTONS
-        .iter()
-        .enumerate()
-        .map(|(i, (key, label, _))| {
-            let focused = app.focus == F_BTN0 + i;
-            let style = if focused {
-                Style::new()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::new().fg(Color::White)
-            };
-            Line::from(Span::styled(format!(" [{key}] {label} "), style))
-        })
-        .collect();
-    f.render_widget(
-        Paragraph::new(buttons).block(
-            Block::bordered()
-                .border_type(BorderType::Rounded)
-                .title(" Действия "),
-        ),
-        btn_a,
-    );
-
-    // подсказка
-    let lp = if valid_port(&app.listen_port) {
-        app.listen_port.as_str()
-    } else {
-        "…"
-    };
-    let hint = format!(
-        "Happ: адрес = IP этого сервера, порт = {lp}. UUID, flow, SNI, public key и shortId — как у основного VPS."
-    );
-    f.render_widget(
-        Paragraph::new(hint)
-            .style(Style::new().fg(Color::Gray))
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::bordered()
-                    .border_type(BorderType::Rounded)
-                    .title(" Подсказка "),
-            ),
-        hint_a,
-    );
-
-    // журнал
-    let h = right.height.saturating_sub(2) as usize;
-    let total = app.log.len();
-    let off = app.log_offset.min(total.saturating_sub(h));
-    let end = total - off;
-    let start = end.saturating_sub(h);
-    let lines: Vec<Line> = app.log[start..end]
-        .iter()
-        .map(|(lvl, text)| {
-            let (prefix, color) = match lvl {
-                Lvl::Info => ("▶ ", Color::Cyan),
-                Lvl::Ok => ("✔ ", Color::Green),
-                Lvl::Warn => ("! ", Color::Yellow),
-                Lvl::Err => ("✘ ", Color::Red),
-                Lvl::Out => ("  ", Color::DarkGray),
-            };
-            Line::from(Span::styled(
-                format!("{prefix}{text}"),
-                Style::new().fg(color),
-            ))
-        })
-        .collect();
-    let log_title = if off > 0 {
-        format!(" Журнал (↑{off}) ")
-    } else {
-        " Журнал ".to_string()
-    };
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered()
-                .border_type(BorderType::Rounded)
-                .title(log_title),
-        ),
-        right,
-    );
-
-    // подвал
-    f.render_widget(
-        Paragraph::new(
-            "Tab/↑↓ поле · ←→/Пробел протокол · Enter действие · F5 применить · F6 удалить · \
-             F7 статус · F8 проверить · F9 сохранить · PgUp/PgDn журнал · Esc выход",
-        )
-        .style(Style::new().fg(Color::DarkGray))
-        .wrap(Wrap { trim: true })
-        .block(Block::bordered().border_type(BorderType::Rounded)),
-        foot,
-    );
-}
-
-// ───────────────────────── main ─────────────────────────
-
-fn run_app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+fn main() -> io::Result<()> {
     let mut app = App::new();
-    while !app.quit {
-        terminal.draw(|f| ui(f, &app))?;
+    let mut terminal: DefaultTerminal = ratatui::init();
+    let result = (|| loop {
+        terminal.draw(|frame| ui(frame, &mut app))?;
         if let Event::Key(key) = event::read()? {
-            if let Some(action) = app.on_key(key) {
-                app.busy = true;
-                terminal.draw(|f| ui(f, &app))?;
-                app.exec(action);
-                app.busy = false;
+            if app.key(key) {
+                return Ok(());
             }
         }
-    }
-    Ok(())
-}
-
-fn main() -> std::io::Result<()> {
-    let mut terminal = ratatui::init();
-    let result = run_app(&mut terminal);
+    })();
     ratatui::restore();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn imports_both_protocols_and_rejects_invalid_input() {
+        let routes = discover(
+            "-A PREROUTING -m comment --comment \"relay-tui:tcp:443->192.0.2.1:8443\" -j DNAT
+-A FORWARD -m comment --comment relay-tui:udp:443->192.0.2.1:8443 -j ACCEPT
+-A FORWARD -m comment --comment relay-tui:conntrack",
+        );
+        assert_eq!(routes.len(), 1);
+        assert!(routes[0].proto == Proto::Both);
+        assert_eq!(routes[0].route(), "443->192.0.2.1:8443");
+        assert!(Config::parse(Proto::Tcp, "0->192.0.2.1:8443").is_none());
+    }
 }
