@@ -12,6 +12,11 @@ case "$arch" in
     *) fail "Неподдерживаемая архитектура: $arch" ;;
 esac
 
+if [[ -e ./relay-tui || -L ./relay-tui ]]; then
+    [[ -f ./relay-tui && -x ./relay-tui && ! -L ./relay-tui ]] || fail './relay-tui не является исполняемым файлом или это символическая ссылка.'
+    exec ./relay-tui </dev/tty
+fi
+
 base=https://github.com/oshinono/vps-relay-setup/releases/latest/download
 name="relay-tui-$target"
 tmp=$(mktemp -d ./.relay-tui.XXXXXXXX)
